@@ -1,6 +1,7 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
+import { useRouter } from "next/navigation"
 import { ProductCard } from "./product-card"
 import { ShoppingCart, Sparkles, Skull, Zap, Volume2, VolumeX, AlertTriangle, Trash2 } from "lucide-react"
 
@@ -180,11 +181,23 @@ const MEME_PHRASES = [
 ]
 
 export function Shop() {
+  const router = useRouter()
   const [cart, setCart] = useState<Product[]>([])
-  const [isMuted, setIsMuted] = useState(true)
+  const [isMuted, setIsMuted] = useState(false)
   const [showCart, setShowCart] = useState(false)
+  const checkoutAudioRef = useRef<HTMLAudioElement | null>(null)
+  const addToCartAudioRef = useRef<HTMLAudioElement | null>(null)
+
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    checkoutAudioRef.current = new Audio("/touch-grass-audio.mpeg")
+    addToCartAudioRef.current = new Audio("/add-to-cart-audio.mpeg")
+  }, [])
 
   const addToCart = (product: Product) => {
+    if (!isMuted && addToCartAudioRef.current) {
+      void addToCartAudioRef.current.play().catch(() => {})
+    }
     setCart(prev => [...prev, product])
   }
 
@@ -324,7 +337,16 @@ export function Shop() {
                     <AlertTriangle className="w-5 h-5" />
                     CLEAR CART (REGRET)
                   </button>
-                  <button className="w-full py-3 bg-primary text-primary-foreground rounded-xl font-bold hover:scale-105 transition-transform flex items-center justify-center gap-2 neon-box">
+                  <button
+                    onClick={() => {
+                      if (!isMuted && checkoutAudioRef.current) {
+                        void checkoutAudioRef.current.play().catch(() => {})
+                      }
+                      setShowCart(false)
+                      router.push("/checkout")
+                    }}
+                    className="w-full py-3 bg-primary text-primary-foreground rounded-xl font-bold hover:scale-105 transition-transform flex items-center justify-center gap-2 neon-box"
+                  >
                     <Sparkles className="w-5 h-5" />
                     CHECKOUT (REAL)
                     <Sparkles className="w-5 h-5" />

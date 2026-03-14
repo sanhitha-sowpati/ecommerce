@@ -2,6 +2,7 @@
 
 import { useRef, useState, useEffect, useCallback } from "react"
 import { AlertTriangle, Camera, Scan, Skull, Sparkles, Zap } from "lucide-react"
+import * as faceapi from "face-api.js"
 
 interface FaceScannerProps {
   onAccessGranted: () => void
@@ -29,6 +30,13 @@ export function FaceScanner({ onAccessGranted }: FaceScannerProps) {
   const [scanProgress, setScanProgress] = useState(0)
   const [faceDetected, setFaceDetected] = useState(false)
   const [cameraReady, setCameraReady] = useState(false)
+  const [modelsReady, setModelsReady] = useState(false)
+  const [referenceReady, setReferenceReady] = useState(false)
+  const referenceDescriptorRef = useRef<Float32Array | null>(null)
+  const [matchDistance, setMatchDistance] = useState<number | null>(null)
+  const loadingAudioRef = useRef<HTMLAudioElement | null>(null)
+
+  const MATCH_THRESHOLD = 0.5
 
   const startCamera = useCallback(async () => {
     try {
@@ -42,13 +50,21 @@ export function FaceScanner({ onAccessGranted }: FaceScannerProps) {
         setError(null)
       }
     } catch {
-      setError("CAMERA ACCESS DENIED! NO FACE = NO DRIP! 💀")
+      setError("CAMERA ACCESS DENIED! CAMERA REQUIRED TO ENTER.")
     }
   }, [])
 
   useEffect(() => {
     startCamera()
+    if (typeof window !== "undefined") {
+      loadingAudioRef.current = new Audio("/face-loading-audio.mpeg")
+      loadingAudioRef.current.loop = true
+    }
     return () => {
+      if (loadingAudioRef.current) {
+        loadingAudioRef.current.pause()
+        loadingAudioRef.current.currentTime = 0
+      }
       if (videoRef.current?.srcObject) {
         const tracks = (videoRef.current.srcObject as MediaStream).getTracks()
         tracks.forEach(track => track.stop())
@@ -56,75 +72,104 @@ export function FaceScanner({ onAccessGranted }: FaceScannerProps) {
     }
   }, [startCamera])
 
-  // Simple face detection using canvas brightness analysis
-  const detectFace = useCallback(() => {
-    if (!videoRef.current || !canvasRef.current || !cameraReady) return false
+  const loadModels = useCallback(async () => {
+    try {
+      const modelUrl = "/models"
+      await Promise.all([
+        faceapi.nets.tinyFaceDetector.loadFromUri(modelUrl),
+        faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl),
+        faceapi.nets.faceRecognitionNet.loadFromUri(modelUrl),
+      ])
+      setModelsReady(true)
+      setError(null)
+    } catch {
+      setError("FAILED TO LOAD FACE MODELS. CHECK NETWORK OR /public/models.")
+    }
+  }, [])
 
-    const canvas = canvasRef.current
-    const ctx = canvas.getContext("2d")
-    if (!ctx) return false
+  const loadReferenceDescriptor = useCallback(async () => {
+    try {
+      const img = await faceapi.fetchImage("/reference-face.png")
+      const detection = await faceapi
+        .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 320 }))
+        .withFaceLandmarks()
+        .withFaceDescriptor()
 
-    canvas.width = 320
-    canvas.height = 240
-    ctx.drawImage(videoRef.current, 0, 0, 320, 240)
-
-    // Analyze center region for face-like features (skin tones, contrast)
-    const centerX = 120
-    const centerY = 80
-    const regionSize = 80
-    const imageData = ctx.getImageData(centerX, centerY, regionSize, regionSize)
-    const data = imageData.data
-
-    let skinPixels = 0
-    let totalPixels = 0
-    let variance = 0
-    let avgBrightness = 0
-
-    // First pass: calculate average
-    for (let i = 0; i < data.length; i += 4) {
-      const r = data[i]
-      const g = data[i + 1]
-      const b = data[i + 2]
-      avgBrightness += (r + g + b) / 3
-      totalPixels++
-
-      // Detect skin-like tones
-      if (r > 60 && g > 40 && b > 20 && r > g && r > b && Math.abs(r - g) > 15) {
-        skinPixels++
+      if (!detection?.descriptor) {
+        setError("NO FACE FOUND IN reference-face.png. USE A CLEAR FRONT-FACING PHOTO.")
+        return
       }
+
+      referenceDescriptorRef.current = detection.descriptor
+      setReferenceReady(true)
+      setError(null)
+    } catch {
+      setError("FAILED TO LOAD reference-face.png. MAKE SURE IT EXISTS IN /public.")
     }
-
-    avgBrightness /= totalPixels
-
-    // Second pass: calculate variance (for texture detection)
-    for (let i = 0; i < data.length; i += 4) {
-      const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3
-      variance += Math.pow(brightness - avgBrightness, 2)
-    }
-    variance /= totalPixels
-
-    const skinRatio = skinPixels / totalPixels
-    const hasTexture = variance > 200 && variance < 5000
-
-    // Face detected if there's skin tones and texture
-    return skinRatio > 0.1 && hasTexture && avgBrightness > 30
-  }, [cameraReady])
+  }, [])
 
   useEffect(() => {
-    if (!cameraReady) return
+    loadModels()
+  }, [loadModels])
+
+  useEffect(() => {
+    if (!modelsReady) return
+    loadReferenceDescriptor()
+  }, [modelsReady, loadReferenceDescriptor])
+
+  const detectAndCompareFace = useCallback(async () => {
+    if (!videoRef.current || !cameraReady || !modelsReady || !referenceReady) return null
+    if (!referenceDescriptorRef.current) return null
+
+    const video = videoRef.current
+    const result = await faceapi
+      .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 }))
+      .withFaceLandmarks()
+      .withFaceDescriptor()
+
+    if (!result?.descriptor) return null
+
+    const dist = faceapi.euclideanDistance(referenceDescriptorRef.current, result.descriptor)
+    return dist
+  }, [cameraReady, modelsReady, referenceReady])
+
+  useEffect(() => {
+    if (!cameraReady || !modelsReady || !referenceReady) return
+    let cancelled = false
 
     const interval = setInterval(() => {
-      const detected = detectFace()
-      setFaceDetected(detected)
+      void (async () => {
+        const dist = await detectAndCompareFace()
+        if (cancelled) return
+        setMatchDistance(dist)
+        setFaceDetected(dist !== null && dist <= MATCH_THRESHOLD)
+      })()
     }, 200)
 
-    return () => clearInterval(interval)
-  }, [cameraReady, detectFace])
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [cameraReady, modelsReady, referenceReady, detectAndCompareFace])
 
   const startScan = async () => {
-    if (!faceDetected) {
-      setError("NO FACE DETECTED! SHOW YOUR FACE BESTIE! 👁️👄👁️")
+    if (!cameraReady) {
+      setError("CAMERA NOT READY.")
       return
+    }
+
+    if (!modelsReady || !referenceReady) {
+      setError("LOADING FACE MODELS... TRY AGAIN IN A SECOND.")
+      return
+    }
+
+    if (!faceDetected) {
+      setError("FACE DOES NOT MATCH THE REFERENCE PHOTO.")
+      return
+    }
+
+    if (loadingAudioRef.current) {
+      void loadingAudioRef.current.play().catch(() => {})
     }
 
     setIsScanning(true)
@@ -142,8 +187,20 @@ export function FaceScanner({ onAccessGranted }: FaceScannerProps) {
 
     // Grant access
     setTimeout(() => {
+      if (loadingAudioRef.current) {
+        loadingAudioRef.current.pause()
+        loadingAudioRef.current.currentTime = 0
+      }
       onAccessGranted()
     }, 500)
+  }
+
+  const skipRecognition = () => {
+    if (loadingAudioRef.current) {
+      loadingAudioRef.current.pause()
+      loadingAudioRef.current.currentTime = 0
+    }
+    onAccessGranted()
   }
 
   return (
@@ -221,7 +278,14 @@ export function FaceScanner({ onAccessGranted }: FaceScannerProps) {
               ? "bg-secondary text-secondary-foreground" 
               : "bg-destructive text-destructive-foreground"
           }`}>
-            {faceDetected ? "✅ FACE DETECTED" : "❌ NO FACE"}
+            {(() => {
+              if (!cameraReady) return "📷 CAMERA LOADING"
+              if (!modelsReady) return "⏳ LOADING MODELS"
+              if (!referenceReady) return "🖼️ LOADING REFERENCE"
+              if (matchDistance === null) return "❌ NO FACE"
+              if (faceDetected) return `✅ MATCH (${matchDistance.toFixed(2)})`
+              return `❌ NO MATCH (${matchDistance.toFixed(2)})`
+            })()}
           </div>
         </div>
 
@@ -278,13 +342,12 @@ export function FaceScanner({ onAccessGranted }: FaceScannerProps) {
           <span>POWERED BY OHIO TECHNOLOGY</span>
           <Zap className="w-4 h-4 text-accent" />
         </div>
-
-        {/* Skip button for testing */}
         <button
-          onClick={onAccessGranted}
-          className="text-xs text-muted-foreground hover:text-primary underline transition-colors"
+          type="button"
+          onClick={skipRecognition}
+          className="mt-2 text-[10px] text-muted-foreground hover:text-primary underline underline-offset-4"
         >
-          skip for testing (no cap)
+          skip face recognition (testing only)
         </button>
       </div>
     </div>
